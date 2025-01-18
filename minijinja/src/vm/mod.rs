@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+
+#[cfg(any(feature = "macros", feature = "multi_template"))]
+use std::sync::Arc;
 
 use crate::compiler::instructions::{
     Instruction, Instructions, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
@@ -11,11 +12,9 @@ use crate::error::{Error, ErrorKind};
 use crate::output::{CaptureMode, Output};
 use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
 use crate::value::namespace_object::Namespace;
-use crate::value::{
-    ops, value_map_with_capacity, value_optimization, Kwargs, ObjectRepr, Value, ValueMap,
-};
-use crate::vm::context::{Frame, LoopState, Stack};
-use crate::vm::loop_object::Loop;
+use crate::value::{ops, value_map_with_capacity, Kwargs, ObjectRepr, Value, ValueMap};
+use crate::vm::context::{Frame, Stack};
+use crate::vm::loop_object::{Loop, LoopState};
 use crate::vm::state::BlockStack;
 
 #[cfg(feature = "macros")]
@@ -91,7 +90,6 @@ impl<'env> Vm<'env> {
         out: &mut Output,
         auto_escape: AutoEscape,
     ) -> Result<(Option<Value>, State<'template, 'env>), Error> {
-        let _guard = value_optimization();
         let mut state = State::new(
             self.env,
             Context::new_with_frame(ok!(Frame::new_checked(root)), self.env.recursion_limit()),
@@ -198,8 +196,16 @@ impl<'env> Vm<'env> {
         let mut parent_instructions = None;
 
         macro_rules! recurse_loop {
-            ($capture:expr) => {{
-                let jump_target = ctx_ok!(self.prepare_loop_recursion(state));
+            ($capture:expr, $loop_object:expr) => {{
+                let jump_target = match $loop_object.recurse_jump_target {
+                    Some(jump_target) => jump_target,
+                    None => {
+                        bail!(Error::new(
+                            ErrorKind::InvalidOperation,
+                            "cannot recurse outside of recursive loop",
+                        ))
+                    }
+                };
                 // the way this works is that we remember the next instruction
                 // as loop exit jump target.  Whenever a loop is pushed, it
                 // memorizes the value in `next_loop_iteration_jump` to jump
@@ -480,15 +486,16 @@ impl<'env> Vm<'env> {
                     ctx_ok!(state.ctx.push_frame(Frame::default()));
                 }
                 Instruction::PopFrame => {
-                    if let Some(mut loop_ctx) = state.ctx.pop_frame().current_loop {
-                        if let Some((target, end_capture)) = loop_ctx.current_recursion_jump.take()
-                        {
-                            pc = target;
-                            if end_capture {
-                                stack.push(out.end_capture(state.auto_escape));
-                            }
-                            continue;
+                    state.ctx.pop_frame();
+                }
+                Instruction::PopLoopFrame => {
+                    let mut l = state.ctx.pop_frame().current_loop.unwrap();
+                    if let Some((target, end_capture)) = l.current_recursion_jump.take() {
+                        pc = target;
+                        if end_capture {
+                            stack.push(out.end_capture(state.auto_escape));
                         }
+                        continue;
                     }
                 }
                 #[cfg(feature = "macros")]
@@ -501,24 +508,7 @@ impl<'env> Vm<'env> {
                     ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
                 }
                 Instruction::Iterate(jump_target) => {
-                    let l = state.ctx.current_loop().unwrap();
-                    l.object.idx.fetch_add(1, Ordering::Relaxed);
-
-                    let next = {
-                        #[cfg(feature = "adjacent_loop_items")]
-                        {
-                            let mut triple = l.object.value_triple.lock().unwrap();
-                            triple.0 = triple.1.take();
-                            triple.1 = triple.2.take();
-                            triple.2 = l.iterator.next();
-                            triple.1.clone()
-                        }
-                        #[cfg(not(feature = "adjacent_loop_items"))]
-                        {
-                            l.iterator.next()
-                        }
-                    };
-                    match next {
+                    match state.ctx.current_loop().unwrap().next() {
                         Some(item) => stack.push(assert_valid!(item)),
                         None => {
                             pc = *jump_target;
@@ -527,8 +517,9 @@ impl<'env> Vm<'env> {
                     };
                 }
                 Instruction::PushDidNotIterate => {
-                    let l = state.ctx.current_loop().unwrap();
-                    stack.push(Value::from(l.object.idx.load(Ordering::Relaxed) == 0));
+                    stack.push(Value::from(
+                        state.ctx.current_loop().unwrap().did_not_iterate(),
+                    ));
                 }
                 Instruction::Jump(jump_target) => {
                     pc = *jump_target;
@@ -618,19 +609,21 @@ impl<'env> Vm<'env> {
                             ));
                         }
                         ctx_ok!(self.perform_super(state, out, true))
-                    // loop is a special name which when called recurses the current loop.
-                    } else if *name == "loop" {
-                        if args.len() != 1 {
-                            bail!(Error::new(
-                                ErrorKind::InvalidOperation,
-                                "loop() takes one argument"
-                            ));
-                        }
-                        // leave the one argument on the stack for the recursion.  The
-                        // recurse_loop! macro itself will perform a jump and not return here.
-                        recurse_loop!(true);
                     } else if let Some(func) = state.lookup(name) {
-                        ctx_ok!(func.call(state, args))
+                        // calling loops is a special operation that starts the recursion process.
+                        // this bypasses the actual `call` implementation which would just fail
+                        // with an error.
+                        if let Some(loop_object) = func.downcast_object_ref::<Loop>() {
+                            if args.len() != 1 {
+                                bail!(Error::new(
+                                    ErrorKind::InvalidOperation,
+                                    "loop() takes one argument"
+                                ));
+                            }
+                            recurse_loop!(true, loop_object);
+                        } else {
+                            ctx_ok!(func.call(state, args))
+                        }
                     } else {
                         bail!(Error::new(
                             ErrorKind::UnknownFunction,
@@ -664,9 +657,10 @@ impl<'env> Vm<'env> {
                 Instruction::FastSuper => {
                     ctx_ok!(self.perform_super(state, out, false));
                 }
-                Instruction::FastRecurse => {
-                    recurse_loop!(false);
-                }
+                Instruction::FastRecurse => match state.ctx.current_loop() {
+                    Some(l) => recurse_loop!(false, &l.object),
+                    None => bail!(Error::new(ErrorKind::UnknownFunction, "loop is unknown")),
+                },
                 // Explanation on the behavior of `LoadBlocks` and rendering of
                 // inherited templates:
                 //
@@ -879,24 +873,6 @@ impl<'env> Vm<'env> {
         }
     }
 
-    fn prepare_loop_recursion(&self, state: &mut State) -> Result<usize, Error> {
-        if let Some(loop_ctx) = state.ctx.current_loop() {
-            if let Some(recurse_jump_target) = loop_ctx.recurse_jump_target {
-                Ok(recurse_jump_target)
-            } else {
-                Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    "cannot recurse outside of recursive loop",
-                ))
-            }
-        } else {
-            Err(Error::new(
-                ErrorKind::InvalidOperation,
-                "cannot recurse outside of loop",
-            ))
-        }
-    }
-
     #[cfg(feature = "multi_template")]
     fn load_blocks(
         &self,
@@ -986,41 +962,22 @@ impl<'env> Vm<'env> {
         pc: usize,
         current_recursion_jump: Option<(usize, bool)>,
     ) -> Result<(), Error> {
-        #[allow(unused_mut)]
-        let mut iterator = ok!(state.undefined_behavior().try_iter(iterable));
-        // for an iterator where the lower and upper bound are matching we can
-        // consider them to have ExactSizeIterator semantics.  We do however not
-        // expect ExactSizeIterator bounds themselves to support iteration by
-        // other means.
-        let len = match iterator.size_hint() {
-            (lower, Some(upper)) if lower == upper => Some(lower),
-            _ => None,
-        };
+        let iter = ok!(state.undefined_behavior().try_iter(iterable));
         let depth = state
             .ctx
             .current_loop()
-            .filter(|x| x.recurse_jump_target.is_some())
+            .filter(|x| x.object.recurse_jump_target.is_some())
             .map_or(0, |x| x.object.depth + 1);
-        let recursive = flags & LOOP_FLAG_RECURSIVE != 0;
-        let with_loop_var = flags & LOOP_FLAG_WITH_LOOP_VAR != 0;
-        ok!(state.ctx.push_frame(Frame {
-            current_loop: Some(LoopState {
-                with_loop_var,
-                recurse_jump_target: if recursive { Some(pc) } else { None },
+        state.ctx.push_frame(Frame {
+            current_loop: Some(LoopState::new(
+                iter,
+                depth,
+                flags & LOOP_FLAG_WITH_LOOP_VAR != 0,
+                (flags & LOOP_FLAG_RECURSIVE != 0).then_some(pc),
                 current_recursion_jump,
-                object: Arc::new(Loop {
-                    idx: AtomicUsize::new(!0usize),
-                    len,
-                    depth,
-                    #[cfg(feature = "adjacent_loop_items")]
-                    value_triple: Mutex::new((None, None, iterator.next())),
-                    last_changed_value: Mutex::default(),
-                }),
-                iterator,
-            }),
+            )),
             ..Frame::default()
-        }));
-        Ok(())
+        })
     }
 
     fn unpack_list(&self, stack: &mut Stack, count: usize) -> Result<(), Error> {

@@ -2,6 +2,15 @@
 
 All notable changes to MiniJinja are documented here.
 
+## 2.7.0
+
+- Removed string interning.  #675
+- `loop.nextitem` is now a lazy operation.  This prevents issues when
+  iterating over one-shot iterators combined with `{% break %}` and
+  it now ensures that the iterator is not running "one item ahead".  #677
+- Fixed an issue that caused loop aliasing not to be supported for
+  recursive loops.  #678
+
 ## 2.6.0
 
 - Added `sum` filter.  #648
@@ -21,6 +30,7 @@ All notable changes to MiniJinja are documented here.
   iterators that were projected from objects.  #663
 - The `|items` filter will no longer allocate a list and instead
   return an iterator.  #665
+- Fixed a bug that caused `lstrip_blocks` to act too eager.  #674
 
 ## 2.5.0
 
