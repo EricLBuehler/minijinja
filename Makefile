@@ -15,7 +15,7 @@ doc:
 .PHONY: test-msrv
 test-msrv:
 	@$(MAKE) run-tests FEATURES=$(TEST_FEATURES)
-	@$(MAKE) run-tests FEATURES=$(TEST_FEATURES),preserve_order,key_interning,unicode
+	@$(MAKE) run-tests FEATURES=$(TEST_FEATURES),preserve_order,unicode
 	@echo "CARGO TEST ALL FEATURES"
 	@cd minijinja; cargo test --all-features
 
@@ -26,7 +26,7 @@ test: test-msrv test-cli
 
 .PHONY: wasi-test
 wasi-test:
-	@cd minijinja; cargo test --all-features --target=wasm32-wasi -- --nocapture
+	@cd minijinja; cargo test --all-features --target=wasm32-wasip1 -- --nocapture
 
 .PHONY: python-test
 python-test:

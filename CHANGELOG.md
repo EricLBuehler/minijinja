@@ -2,6 +2,38 @@
 
 All notable changes to MiniJinja are documented here.
 
+## 2.9.0
+
+- Raise MSRV to 1.70.
+- The contrib crate now uses a basic xorrand implementation instead
+  of depending on all of the `rand` module.  #696
+
+## 2.8.0
+
+- Added `SemiStrict` undefined mode that is like strict but allows
+  to be checked for truthiness.  Additionally an if expression without
+  an else block will always produce a silent undefined object that
+  never errors for compatibility with Jinja2.  #687
+- Make the trait bounds of `ViaDeserialize` stricter.  Now the type
+  can only be constructed if the type implements `DeserializeOwned`.
+  This is not a new requirement for passing the function to
+  `add_function` but bad code will now error earlier for better
+  error reporting.  #689
+
+## 2.7.0
+
+- Removed string interning.  #675
+- `loop.nextitem` is now a lazy operation.  This prevents issues when
+  iterating over one-shot iterators combined with `{% break %}` and
+  it now ensures that the iterator is not running "one item ahead".  #677
+- Fixed an issue that caused loop aliasing not to be supported for
+  recursive loops.  #678
+- CLI moved from `serde_yml` to `serde_yaml`.  #684
+- Improved undefined error reporting.  Undefined values will now in most
+  cases point to exactly where the error happened.  #686
+- Allow newer notify dependency versions (up to 8.x) for the autoreload
+  crate.  #688
+
 ## 2.6.0
 
 - Added `sum` filter.  #648
@@ -21,6 +53,7 @@ All notable changes to MiniJinja are documented here.
   iterators that were projected from objects.  #663
 - The `|items` filter will no longer allocate a list and instead
   return an iterator.  #665
+- Fixed a bug that caused `lstrip_blocks` to act too eager.  #674
 
 ## 2.5.0
 

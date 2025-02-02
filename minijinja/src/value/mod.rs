@@ -229,8 +229,6 @@ pub(crate) mod namespace_object;
 mod object;
 pub(crate) mod ops;
 mod serialize;
-#[cfg(feature = "key_interning")]
-mod string_interning;
 
 #[cfg(feature = "deserialization")]
 pub use self::deserialize::ViaDeserialize;
@@ -264,7 +262,7 @@ thread_local! {
     // This should be an AtomicU64 but sadly 32bit targets do not necessarily have
     // AtomicU64 available.
     static LAST_VALUE_HANDLE: Cell<u32> = const { Cell::new(0) };
-    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = RefCell::new(BTreeMap::new());
+    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Function that returns true when serialization for [`Value`] is taking place.
@@ -285,22 +283,6 @@ thread_local! {
 /// deserialized.
 pub fn serializing_for_value() -> bool {
     INTERNAL_SERIALIZATION.with(|flag| flag.get())
-}
-
-/// Enables value optimizations.
-///
-/// If `key_interning` is enabled, this turns on that feature, otherwise
-/// it becomes a noop.
-#[inline(always)]
-pub(crate) fn value_optimization() -> impl Drop {
-    #[cfg(feature = "key_interning")]
-    {
-        crate::value::string_interning::use_string_cache()
-    }
-    #[cfg(not(feature = "key_interning"))]
-    {
-        OnDrop::new(|| {})
-    }
 }
 
 fn mark_internal_serialization() -> impl Drop {
@@ -428,7 +410,11 @@ impl SmallStr {
 
 #[derive(Clone)]
 pub(crate) enum ValueRepr {
+    /// The regular undefined type produced as part of template evaluation
     Undefined,
+    /// A special undefined marker that indicates an always-quiet undefined.
+    /// This is emitted for ternary expressions with missing else blocks.
+    SilentUndefined,
     Bool(bool),
     U64(u64),
     I64(i64),
@@ -446,7 +432,7 @@ pub(crate) enum ValueRepr {
 impl fmt::Debug for ValueRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ValueRepr::Undefined => f.write_str("undefined"),
+            ValueRepr::Undefined | ValueRepr::SilentUndefined => f.write_str("undefined"),
             ValueRepr::Bool(ref val) => fmt::Debug::fmt(val, f),
             ValueRepr::U64(ref val) => fmt::Debug::fmt(val, f),
             ValueRepr::I64(ref val) => fmt::Debug::fmt(val, f),
@@ -476,7 +462,7 @@ impl fmt::Debug for ValueRepr {
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self.0 {
-            ValueRepr::None | ValueRepr::Undefined => 0u8.hash(state),
+            ValueRepr::None | ValueRepr::Undefined | ValueRepr::SilentUndefined => 0u8.hash(state),
             ValueRepr::String(ref s, _) => s.hash(state),
             ValueRepr::SmallStr(ref s) => s.as_str().hash(state),
             ValueRepr::Bool(b) => b.hash(state),
@@ -506,7 +492,10 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (&ValueRepr::None, &ValueRepr::None) => true,
-            (&ValueRepr::Undefined, &ValueRepr::Undefined) => true,
+            (
+                &ValueRepr::Undefined | &ValueRepr::SilentUndefined,
+                &ValueRepr::Undefined | &ValueRepr::SilentUndefined,
+            ) => true,
             (&ValueRepr::String(ref a, _), &ValueRepr::String(ref b, _)) => a == b,
             (&ValueRepr::SmallStr(ref a), &ValueRepr::SmallStr(ref b)) => a.as_str() == b.as_str(),
             (&ValueRepr::Bytes(ref a), &ValueRepr::Bytes(ref b)) => a == b,
@@ -536,7 +525,7 @@ impl PartialEq for Value {
                                     need_length_fallback = false;
                                 }
                                 let mut a_count = 0;
-                                if !a.try_iter_pairs().map_or(false, |mut ak| {
+                                if !a.try_iter_pairs().is_some_and(|mut ak| {
                                     ak.all(|(k, v1)| {
                                         a_count += 1;
                                         b.get_value(&k) == Some(v1)
@@ -596,7 +585,10 @@ impl Ord for Value {
         }
         match (&self.0, &other.0) {
             (&ValueRepr::None, &ValueRepr::None) => Ordering::Equal,
-            (&ValueRepr::Undefined, &ValueRepr::Undefined) => Ordering::Equal,
+            (
+                &ValueRepr::Undefined | &ValueRepr::SilentUndefined,
+                &ValueRepr::Undefined | &ValueRepr::SilentUndefined,
+            ) => Ordering::Equal,
             (&ValueRepr::String(ref a, _), &ValueRepr::String(ref b, _)) => a.cmp(b),
             (&ValueRepr::SmallStr(ref a), &ValueRepr::SmallStr(ref b)) => {
                 a.as_str().cmp(b.as_str())
@@ -650,7 +642,7 @@ impl fmt::Debug for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            ValueRepr::Undefined => Ok(()),
+            ValueRepr::Undefined | ValueRepr::SilentUndefined => Ok(()),
             ValueRepr::Bool(val) => val.fmt(f),
             ValueRepr::U64(val) => val.fmt(f),
             ValueRepr::I64(val) => val.fmt(f),
@@ -685,36 +677,10 @@ impl Default for Value {
     }
 }
 
-/// Intern a string.
-///
-/// When the `key_interning` feature is in used, then MiniJinja will attempt to
-/// reuse strings in certain cases.  This function can be used to utilize the
-/// same functionality.  There is no guarantee that a string will be interned
-/// as there are heuristics involved for it.  Additionally the string interning
-/// will only work during the template engine execution (eg: within filters etc.).
-///
-/// The use of this function is generally recommended against and it might
-/// become deprecated in the future.
+#[doc(hidden)]
+#[deprecated = "This function no longer has an effect.  Use Arc::from directly."]
 pub fn intern(s: &str) -> Arc<str> {
-    #[cfg(feature = "key_interning")]
-    {
-        crate::value::string_interning::try_intern(s)
-    }
-    #[cfg(not(feature = "key_interning"))]
-    {
-        Arc::from(s.to_string())
-    }
-}
-
-/// Like [`intern`] but returns a [`Value`] instead of an `Arc<str>`.
-///
-/// This has the benefit that it will only perform interning if the string
-/// is not already interned.
-pub(crate) fn intern_into_value(s: &str) -> Value {
-    match SmallStr::try_new(s) {
-        Some(small_str) => Value(ValueRepr::SmallStr(small_str)),
-        None => Value::from(intern(s)),
-    }
+    Arc::from(s.to_string())
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -755,7 +721,6 @@ impl Value {
     /// serde deserialization.
     pub fn from_serialize<T: Serialize>(value: T) -> Value {
         let _serialization_guard = mark_internal_serialization();
-        let _optimization_guard = value_optimization();
         transform(value)
     }
 
@@ -1088,7 +1053,7 @@ impl Value {
     /// perform operations on it.
     pub fn kind(&self) -> ValueKind {
         match self.0 {
-            ValueRepr::Undefined => ValueKind::Undefined,
+            ValueRepr::Undefined | ValueRepr::SilentUndefined => ValueKind::Undefined,
             ValueRepr::Bool(_) => ValueKind::Bool,
             ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::F64(_) => ValueKind::Number,
             ValueRepr::None => ValueKind::None,
@@ -1152,7 +1117,10 @@ impl Value {
             ValueRepr::String(ref x, _) => !x.is_empty(),
             ValueRepr::SmallStr(ref x) => !x.is_empty(),
             ValueRepr::Bytes(ref x) => !x.is_empty(),
-            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => false,
+            ValueRepr::None
+            | ValueRepr::Undefined
+            | ValueRepr::SilentUndefined
+            | ValueRepr::Invalid(_) => false,
             ValueRepr::Object(ref x) => x.is_true(),
         }
     }
@@ -1164,7 +1132,7 @@ impl Value {
 
     /// Returns `true` if this value is undefined.
     pub fn is_undefined(&self) -> bool {
-        matches!(&self.0, ValueRepr::Undefined)
+        matches!(&self.0, ValueRepr::Undefined | ValueRepr::SilentUndefined)
     }
 
     /// Returns `true` if this value is none.
@@ -1265,7 +1233,9 @@ impl Value {
     /// ```
     pub fn get_attr(&self, key: &str) -> Result<Value, Error> {
         let value = match self.0 {
-            ValueRepr::Undefined => return Err(Error::from(ErrorKind::UndefinedError)),
+            ValueRepr::Undefined | ValueRepr::SilentUndefined => {
+                return Err(Error::from(ErrorKind::UndefinedError))
+            }
             ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)),
             _ => None,
         };
@@ -1316,7 +1286,7 @@ impl Value {
     /// assert_eq!(value.to_string(), "Foo");
     /// ```
     pub fn get_item(&self, key: &Value) -> Result<Value, Error> {
-        if let ValueRepr::Undefined = self.0 {
+        if let ValueRepr::Undefined | ValueRepr::SilentUndefined = self.0 {
             Err(Error::from(ErrorKind::UndefinedError))
         } else {
             Ok(self.get_item_opt(key).unwrap_or(Value::UNDEFINED))
@@ -1350,7 +1320,9 @@ impl Value {
     /// ```
     pub fn try_iter(&self) -> Result<ValueIter, Error> {
         match self.0 {
-            ValueRepr::None | ValueRepr::Undefined => Some(ValueIterImpl::Empty),
+            ValueRepr::None | ValueRepr::Undefined | ValueRepr::SilentUndefined => {
+                Some(ValueIterImpl::Empty)
+            }
             ValueRepr::String(ref s, _) => {
                 Some(ValueIterImpl::Chars(0, s.chars().count(), Arc::clone(s)))
             }
@@ -1381,7 +1353,9 @@ impl Value {
     ///   reversible itself, it consumes it and then reverses it.
     pub fn reverse(&self) -> Result<Value, Error> {
         match self.0 {
-            ValueRepr::Undefined | ValueRepr::None => Some(self.clone()),
+            ValueRepr::Undefined | ValueRepr::SilentUndefined | ValueRepr::None => {
+                Some(self.clone())
+            }
             ValueRepr::String(ref s, _) => Some(Value::from(s.chars().rev().collect::<String>())),
             ValueRepr::SmallStr(ref s) => {
                 // TODO: add small str optimization here
@@ -1672,9 +1646,10 @@ impl Serialize for Value {
             ValueRepr::U64(u) => serializer.serialize_u64(u),
             ValueRepr::I64(i) => serializer.serialize_i64(i),
             ValueRepr::F64(f) => serializer.serialize_f64(f),
-            ValueRepr::None | ValueRepr::Undefined | ValueRepr::Invalid(_) => {
-                serializer.serialize_unit()
-            }
+            ValueRepr::None
+            | ValueRepr::Undefined
+            | ValueRepr::SilentUndefined
+            | ValueRepr::Invalid(_) => serializer.serialize_unit(),
             ValueRepr::U128(u) => serializer.serialize_u128(u.0),
             ValueRepr::I128(i) => serializer.serialize_i128(i.0),
             ValueRepr::String(ref s, _) => serializer.serialize_str(s),

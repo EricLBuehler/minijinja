@@ -180,6 +180,15 @@
 //! {{ title|upper if title }}
 //! ```
 //!
+//! Note that for compatibility with Jinja2, when the `else` block is missing the undefined
+//! value will be marked as "silent".  This means even if strict undefined behavior is
+//! requested, this undefined value will print to an empty string.  This means
+//! that this is always valid:
+//!
+//! ```jinja
+//! {{ value if false }} -> prints an empty string (silent undefined returned from else)
+//! ```
+//!
 //! # Tags
 //!
 //! Tags control logic in templates.  The following tags exist:
@@ -745,6 +754,11 @@
 //! {%- if loop.index >= 10 %}{% break %}{% endif %}
 //! {%- endfor %}
 //! ```
+//!
+//! **Note on one-shot iterators:** if you break from a loop but you have
+//! accessed the `loop.nextitem` special variable, then you will lose one item.
+//! This is because accessing that attribute will peak into the iterator and
+//! there is no support for "putting values back".
 //!
 #![cfg_attr(
     feature = "custom_syntax",

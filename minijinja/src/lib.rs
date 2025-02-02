@@ -187,12 +187,6 @@
 //!   limited.
 //! - `speedups`: enables all speedups, in particular it turns on the `v_htmlescape` dependency
 //!   for faster HTML escaping.
-//! - `key_interning`: if this feature is enabled the automatic string interning in
-//!   the value type is enabled.  This feature used to be turned on by default but
-//!   has negative performance effects in newer versions of MiniJinja since a lot of
-//!   the previous uses of key interning are no longer needed.  Enabling it however
-//!   cuts down on memory usage slightly in certain scenarios by interning all string
-//!   keys used in dynamic map values.
 //!
 //! Internals:
 //!
@@ -259,7 +253,7 @@ const _: () = {
         since = "2.0.4",
         note = "Future versions of MiniJinja will require enabling \
         the 'serde' feature to use serde types.  To silence this warning \
-        add 'serde' to the least of features of minijinja."
+        add 'serde' to the list of features of minijinja."
     )]
     #[allow(unused)]
     fn enable_implicit_serde_support() {}

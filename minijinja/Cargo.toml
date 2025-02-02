@@ -1,6 +1,6 @@
 [package]
 name = "minijinja"
-version = "2.5.0"
+version = "2.7.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
@@ -9,7 +9,7 @@ homepage = "https://github.com/mitsuhiko/minijinja"
 repository = "https://github.com/mitsuhiko/minijinja"
 keywords = ["jinja", "jinja2", "templates"]
 readme = "README.md"
-rust-version = "1.63"
+rust-version = "1.70"
 exclude = ["tests"]
 
 [package.metadata.docs.rs]
@@ -39,7 +39,6 @@ std_collections = []
 serde = []
 
 # Speedups
-key_interning = []
 speedups = ["v_htmlescape"]
 
 # Engine Features
@@ -53,6 +52,9 @@ fuel = []
 # Extra Filters
 json = ["serde_json"]
 urlencode = ["percent-encoding"]
+
+# Deprecated features
+key_interning = []
 
 # Internal Features that should not be used
 internal_debug = []
